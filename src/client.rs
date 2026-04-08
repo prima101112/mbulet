@@ -22,6 +22,10 @@ use std::{
 const SIDEBAR_BG: Color = Color::Rgb(18, 18, 28);
 const BAR_BG: Color = Color::Rgb(18, 18, 28);
 
+/// Prefix key for mbulet commands (e.g., Ctrl+B). Change this single constant to use a different prefix.
+const PREFIX_KEY: char = 'b';
+const PREFIX_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL;
+
 struct ClientSession {
     id: usize,
     name: String,
@@ -38,7 +42,7 @@ enum Focus {
 #[derive(PartialEq)]
 enum PrefixMode {
     Normal,
-    Pending, // waiting for the command key after prefix (Ctrl+B)
+    Pending, // waiting for the command key after prefix
 }
 
 struct App {
@@ -114,11 +118,47 @@ impl App {
         };
         self.list_state.select(Some(self.selected));
     }
+
+    fn move_session_up(&mut self) -> Option<(usize, usize)> {
+        if self.sessions.is_empty() || self.selected == 0 {
+            return None;
+        }
+        let id = self.sessions[self.selected].id;
+        let new_index = self.selected - 1;
+        // Client-side optimistic update
+        self.sessions.swap(self.selected, new_index);
+        self.selected = new_index;
+        self.list_state.select(Some(new_index));
+        Some((id, new_index))
+    }
+
+    fn move_session_down(&mut self) -> Option<(usize, usize)> {
+        if self.sessions.is_empty() || self.selected >= self.sessions.len() - 1 {
+            return None;
+        }
+        let id = self.sessions[self.selected].id;
+        let new_index = self.selected + 1;
+        // Client-side optimistic update
+        self.sessions.swap(self.selected, new_index);
+        self.selected = new_index;
+        self.list_state.select(Some(new_index));
+        Some((id, new_index))
+    }
 }
 
+/// Calculate the actual terminal pane size from the UI layout.
+/// This must match the constraints in ui() to avoid parser/render desync.
 fn pane_size(cols: u16, rows: u16) -> (u16, u16) {
-    let term_cols = cols.saturating_sub(22 + 2).max(1);
-    let term_rows = rows.saturating_sub(2 + 2).max(1);
+    // Match the UI layout exactly:
+    // - Vertical: 1 (top bar) + content + 1 (bottom bar)
+    // - Horizontal: 22 (sidebar) + terminal
+    // - Terminal has borders: -2 for left/right, -2 for top/bottom
+    let content_rows = rows.saturating_sub(1 + 1); // top + bottom bars
+    let term_rows = content_rows.saturating_sub(2).max(1); // border overhead
+    
+    let content_cols = cols.saturating_sub(22); // sidebar width
+    let term_cols = content_cols.saturating_sub(2).max(1); // border overhead
+    
     (term_cols, term_rows)
 }
 
@@ -228,6 +268,31 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                     s.name = name;
                                 }
                             }
+                            DaemonMsg::SessionReordered { id, new_index } => {
+                                let mut app = app.lock().unwrap();
+                                if let Some(old_index) = app.sessions.iter().position(|s| s.id == id) {
+                                    if new_index < app.sessions.len() {
+                                        let session = app.sessions.remove(old_index);
+                                        app.sessions.insert(new_index, session);
+                                        // Keep selection stable: if this was the selected session, update selection
+                                        if app.selected == old_index {
+                                            app.selected = new_index;
+                                            app.list_state.select(Some(new_index));
+                                        } else {
+                                            // Adjust selection index if another session was moved around it
+                                            let selected = if old_index < app.selected && new_index >= app.selected {
+                                                app.selected - 1
+                                            } else if old_index > app.selected && new_index <= app.selected {
+                                                app.selected + 1
+                                            } else {
+                                                app.selected
+                                            };
+                                            app.selected = selected;
+                                            app.list_state.select(Some(selected));
+                                        }
+                                    }
+                                }
+                            }
                             DaemonMsg::CwdUpdate { id, cwd } => {
                                 let mut app = app.lock().unwrap();
                                 if let Some(s) = app.sessions.iter_mut().find(|s| s.id == id) {
@@ -237,13 +302,8 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                             DaemonMsg::Attached { id, cleared: _ } => {
                                 let mut app = app.lock().unwrap();
                                 app.attached_id = Some(id);
-                                // Always reset the client parser — it's just a render cache.
-                                // Server sends buffered output right after (or nothing if cleared),
-                                // so the parser will be correctly populated from the buffer replay.
-                                let (tc, tr) = (app.term_cols, app.term_rows);
-                                if let Some(s) = app.sessions.iter().find(|s| s.id == id) {
-                                    *s.parser.lock().unwrap() = vt100::Parser::new(tr.max(1), tc.max(1), 0);
-                                }
+                                // Parser was already reset when Attach was sent (before server
+                                // replayed buffered output), so no action needed here.
                             }
                             DaemonMsg::Detached => {
                                 app.lock().unwrap().attached_id = None;
@@ -273,6 +333,13 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
             (a.current_id(), a.term_cols, a.term_rows)
         };
         if let Some(id) = id {
+            // Reset parser before sending initial attach
+            {
+                let app = app.lock().unwrap();
+                if let Some(s) = app.sessions.iter().find(|s| s.id == id) {
+                    *s.parser.lock().unwrap() = vt100::Parser::new(tr.max(1), tc.max(1), 0);
+                }
+            }
             send_msg(
                 &mut *stream_write.lock().unwrap(),
                 &ClientMsg::Attach { id, cols: tc, rows: tr },
@@ -322,10 +389,63 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                     }
                                     Action::None
                                 }
-                                // ^B ^B → send literal Ctrl+B to terminal
-                                (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                                (KeyCode::Up, _) => {
+                                    if app.focus == Focus::Sidebar {
+                                        // Sidebar focus: move selected session up
+                                        if let Some((id, new_index)) = app.move_session_up() {
+                                            Action::SendMsg(ClientMsg::ReorderSession { id, new_index })
+                                        } else {
+                                            Action::None
+                                        }
+                                    } else {
+                                        // Terminal focus: switch to previous session
+                                        if !app.sessions.is_empty() {
+                                            app.prev();
+                                            if let Some(id) = app.current_id() {
+                                                let (tc, tr) = (app.term_cols, app.term_rows);
+                                                Action::SendMsg(ClientMsg::Attach { id, cols: tc, rows: tr })
+                                            } else {
+                                                Action::None
+                                            }
+                                        } else {
+                                            Action::None
+                                        }
+                                    }
+                                }
+                                (KeyCode::Down, _) => {
+                                    if app.focus == Focus::Sidebar {
+                                        // Sidebar focus: move selected session down
+                                        if let Some((id, new_index)) = app.move_session_down() {
+                                            Action::SendMsg(ClientMsg::ReorderSession { id, new_index })
+                                        } else {
+                                            Action::None
+                                        }
+                                    } else {
+                                        // Terminal focus: switch to next session
+                                        if !app.sessions.is_empty() {
+                                            app.next();
+                                            if let Some(id) = app.current_id() {
+                                                let (tc, tr) = (app.term_cols, app.term_rows);
+                                                Action::SendMsg(ClientMsg::Attach { id, cols: tc, rows: tr })
+                                            } else {
+                                                Action::None
+                                            }
+                                        } else {
+                                            Action::None
+                                        }
+                                    }
+                                }
+                                // Prefix + Prefix → send literal prefix to terminal
+                                (KeyCode::Char(c), m) if c == PREFIX_KEY && m == PREFIX_MODIFIERS => {
                                     if app.focus == Focus::Terminal {
-                                        Action::SendMsg(ClientMsg::Input { data: vec![0x02] })
+                                        // Ctrl+B = 0x02
+                                        let byte = if PREFIX_KEY == 'b' && PREFIX_MODIFIERS == KeyModifiers::CONTROL {
+                                            0x02
+                                        } else {
+                                            // For other prefix keys, compute the control char
+                                            (PREFIX_KEY as u8).to_ascii_lowercase().saturating_sub(b'a').saturating_add(1)
+                                        };
+                                        Action::SendMsg(ClientMsg::Input { data: vec![byte] })
                                     } else {
                                         Action::None
                                     }
@@ -333,8 +453,8 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                 _ => Action::None,
                             }
 
-                        // --- Ctrl+B in any focus → enter pending mode ---
-                        } else if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL {
+                        // --- Prefix key in any focus → enter pending mode ---
+                        } else if key.code == KeyCode::Char(PREFIX_KEY) && key.modifiers == PREFIX_MODIFIERS {
                             prefix_mode = PrefixMode::Pending;
                             Action::None
 
@@ -467,6 +587,14 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                         Action::Detach => { detach = true; break; }
                         Action::Shutdown => { shutdown = true; break; }
                         Action::SendMsg(msg) => {
+                            // Reset parser BEFORE sending Attach to ensure clean slate
+                            // when server replays buffered output
+                            if let ClientMsg::Attach { id, cols, rows } = &msg {
+                                let app = app.lock().unwrap();
+                                if let Some(s) = app.sessions.iter().find(|s| s.id == *id) {
+                                    *s.parser.lock().unwrap() = vt100::Parser::new(*rows.max(&1), *cols.max(&1), 0);
+                                }
+                            }
                             let _ = send_msg(&mut *stream_write.lock().unwrap(), &msg);
                         }
                         Action::None => {}
@@ -573,16 +701,26 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect, ctrl_m_pending
     let sep = |s: &str| Span::styled(s.to_string(), Style::default().fg(Color::DarkGray).bg(BAR_BG));
     let warn = |s: &str| Span::styled(s.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(BAR_BG));
 
-    // Ctrl+M pending: show command mode indicator regardless of focus
+    // Display prefix key dynamically
+    let prefix_display = if PREFIX_MODIFIERS == KeyModifiers::CONTROL {
+        format!("^{}", PREFIX_KEY.to_uppercase())
+    } else if PREFIX_MODIFIERS == KeyModifiers::ALT {
+        format!("M-{}", PREFIX_KEY)
+    } else {
+        PREFIX_KEY.to_string()
+    };
+
+    // Prefix pending: show command mode indicator regardless of focus
     let text = if ctrl_m_pending {
         Line::from(vec![
-            warn("  ⌨  ^B "),
+            warn(&format!("  ⌨  {} ", prefix_display)),
             sep("→ "),
             key("d"), sep(": detach   "),
             key("q"), sep(": shutdown   "),
             key("Tab"), sep(": sidebar   "),
-            key("^B"), sep(": send ^B   "),
-            key("w"), sep(": worktree  "),
+            key(&prefix_display), sep(": send prefix   "),
+            key("w"), sep(": worktree   "),
+            key("↑/↓"), sep(": move session  "),
         ])
     } else if app.worktree_mode {
         Line::from(vec![
@@ -605,19 +743,20 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect, ctrl_m_pending
             key("n"), sep(": new   "),
             key("r"), sep(": rename   "),
             key("d"), sep(": delete   "),
-            key("Enter"), sep(": open terminal   "),
-            key("^B w"), sep(": worktree   "),
-            key("^B d"), sep(": detach   "),
-            key("^B q"), sep(": shutdown  "),
+            key("Enter"), sep(": open   "),
+            key(&format!("{} w", prefix_display)), sep(": worktree   "),
+            key(&format!("{} d", prefix_display)), sep(": detach   "),
+            key(&format!("{} q", prefix_display)), sep(": shutdown  "),
         ])
     } else {
         // Terminal focus
         Line::from(vec![
             sep("  "),
-            key("^B Tab"), sep(": sidebar   "),
-            key("^B d"), sep(": detach   "),
-            key("^B q"), sep(": shutdown   "),
-            key("^B ^B"), sep(": send ^B  "),
+            key(&format!("{} ↑/↓", prefix_display)), sep(": switch session   "),
+            key(&format!("{} Tab", prefix_display)), sep(": sidebar   "),
+            key(&format!("{} d", prefix_display)), sep(": detach   "),
+            key(&format!("{} q", prefix_display)), sep(": shutdown   "),
+            key(&format!("{} {}", prefix_display, prefix_display)), sep(": send prefix  "),
         ])
     };
     frame.render_widget(Paragraph::new(text).style(Style::default().bg(BAR_BG)), area);
@@ -750,6 +889,16 @@ fn draw_terminal(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .border_style(Style::default().fg(border_color)),
         area,
     );
+
+    // Ensure parser dimensions match the actual render area before drawing.
+    // This prevents desync between calculated size and actual allocated space.
+    {
+        let mut parser = session.parser.lock().unwrap();
+        let (parser_rows, parser_cols) = parser.screen().size();
+        if parser_rows != inner.height || parser_cols != inner.width {
+            parser.set_size(inner.height, inner.width);
+        }
+    }
 
     let (lines, cursor_pos) = {
         let screen = session.parser.lock().unwrap();

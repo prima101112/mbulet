@@ -181,6 +181,31 @@ fn handle_client(
                     }
                 }
 
+                ClientMsg::ReorderSession { id, new_index } => {
+                    let mut s = sessions.lock().unwrap();
+                    if let Some(old_index) = s.iter().position(|s| s.id == id) {
+                        if new_index < s.len() {
+                            let session = s.remove(old_index);
+                            s.insert(new_index, session);
+                            let _ = send_msg(&mut stream, &DaemonMsg::SessionReordered { id, new_index });
+                        } else {
+                            let _ = send_msg(
+                                &mut stream,
+                                &DaemonMsg::Error {
+                                    msg: format!("invalid index {}", new_index),
+                                },
+                            );
+                        }
+                    } else {
+                        let _ = send_msg(
+                            &mut stream,
+                            &DaemonMsg::Error {
+                                msg: format!("session {} not found", id),
+                            },
+                        );
+                    }
+                }
+
                 ClientMsg::Attach { id, cols, rows } => {
                     let sessions = sessions.lock().unwrap();
                     if let Some(sess) = sessions.iter().find(|s| s.id == id) {

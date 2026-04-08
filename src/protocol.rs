@@ -13,6 +13,7 @@ pub enum ClientMsg {
     NewSession { name: String, cols: u16, rows: u16, startup_cmds: Vec<String> },
     DeleteSession { id: usize },
     RenameSession { id: usize, name: String },
+    ReorderSession { id: usize, new_index: usize },
     Attach { id: usize, cols: u16, rows: u16 },
     Detach,
     Input { data: Vec<u8> },
@@ -26,6 +27,7 @@ pub enum DaemonMsg {
     SessionCreated { id: usize, name: String },
     SessionDeleted { id: usize },
     SessionRenamed { id: usize, name: String },
+    SessionReordered { id: usize, new_index: usize },
     /// Raw PTY bytes — client feeds into its own vt100 parser
     PtyOutput { id: usize, data: Vec<u8> },
     /// CWD changed for a session (parsed from OSC 7)
