@@ -7,6 +7,48 @@ use std::{
     thread,
 };
 
+/// Validates a session name according to the following rules:
+/// - Length: 1-64 characters
+/// - Allowed: alphanumeric, dash, underscore, space
+/// - Forbidden: /, \, null bytes, leading/trailing whitespace
+fn validate_session_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    
+    // Check for empty or whitespace-only names
+    if trimmed.is_empty() {
+        return Err("session name cannot be empty".to_string());
+    }
+    
+    // Check for leading/trailing whitespace (not allowed)
+    if name != trimmed {
+        return Err("session name cannot have leading or trailing whitespace".to_string());
+    }
+    
+    // Check length bounds
+    if name.len() > 64 {
+        return Err(format!("session name too long (max 64 chars, got {})", name.len()));
+    }
+    
+    // Check for forbidden characters
+    for ch in name.chars() {
+        if ch == '/' {
+            return Err("session name cannot contain forward slash (/)".to_string());
+        }
+        if ch == '\\' {
+            return Err("session name cannot contain backslash (\\)".to_string());
+        }
+        if ch == '\0' {
+            return Err("session name cannot contain null bytes".to_string());
+        }
+        // Allow alphanumeric, dash, underscore, and space
+        if !ch.is_alphanumeric() && ch != '-' && ch != '_' && ch != ' ' {
+            return Err(format!("session name contains invalid character: '{}'", ch));
+        }
+    }
+    
+    Ok(())
+}
+
 pub struct Daemon {
     sessions: Arc<Mutex<Vec<Session>>>,
     next_id: Arc<Mutex<usize>>,
@@ -103,7 +145,7 @@ fn handle_client(
         }
 
         stream
-            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
             .ok();
         let msg: Result<ClientMsg, _> = recv_msg(&mut stream);
 
@@ -123,6 +165,12 @@ fn handle_client(
                 }
 
                 ClientMsg::NewSession { name, cols, rows, startup_cmds } => {
+                    // Validate session name
+                    if let Err(err_msg) = validate_session_name(&name) {
+                        let _ = send_msg(&mut stream, &DaemonMsg::Error { msg: err_msg });
+                        continue;
+                    }
+                    
                     let id = {
                         let mut nid = next_id.lock().unwrap();
                         let id = *nid;
@@ -167,6 +215,12 @@ fn handle_client(
                 }
 
                 ClientMsg::RenameSession { id, name } => {
+                    // Validate session name
+                    if let Err(err_msg) = validate_session_name(&name) {
+                        let _ = send_msg(&mut stream, &DaemonMsg::Error { msg: err_msg });
+                        continue;
+                    }
+                    
                     let mut s = sessions.lock().unwrap();
                     if let Some(sess) = s.iter_mut().find(|s| s.id == id) {
                         sess.name = name.clone();
@@ -213,12 +267,13 @@ fn handle_client(
 
                         // Atomically reset parser + clear buf + resize. If dims changed,
                         // send no buffer — SIGWINCH redraws fresh. Same-size reattach
-                        // sends current buffer so screen is restored.
+                        // sends clean screen snapshot (contents_formatted) which makes
+                        // no assumptions about client parser state — fixes theme corruption.
                         let changed = sess.resize_and_reset(cols, rows);
                         if !changed {
-                            let buf = sess.buffered_output();
-                            if !buf.is_empty() {
-                                let _ = send_msg(&mut stream, &DaemonMsg::PtyOutput { id, data: buf });
+                            let snapshot = sess.screen_snapshot();
+                            if !snapshot.is_empty() {
+                                let _ = send_msg(&mut stream, &DaemonMsg::PtyOutput { id, data: snapshot });
                             }
                         }
 
@@ -231,6 +286,13 @@ fn handle_client(
                         pty_rx = Some(sess.subscribe());
                         cwd_rx = Some(sess.subscribe_cwd());
                         let _ = send_msg(&mut stream, &DaemonMsg::Attached { id, cleared: changed });
+
+                        // Schedule delayed redraw via SIGWINCH (same-size case only).
+                        // The 150ms delay allows the snapshot to settle before triggering
+                        // a clean redraw at the correct dimensions — no back-to-back jitter.
+                        if !changed {
+                            sess.schedule_redraw(cols, rows);
+                        }
                     } else {
                         let _ = send_msg(
                             &mut stream,
