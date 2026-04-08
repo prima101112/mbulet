@@ -1,16 +1,16 @@
-use crate::protocol::{ClientMsg, DaemonMsg, SessionInfo, recv_msg, send_msg};
+use crate::protocol::{recv_msg, send_msg, ClientMsg, DaemonMsg, SessionInfo};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, ListState, Paragraph},
+    Terminal,
 };
 use std::{
     io::{self},
@@ -54,9 +54,13 @@ struct App {
     rename_input: String,
     worktree_mode: bool,
     worktree_input: String,
+    confirm_shutdown: bool,
+    error_message: Option<String>,
     term_cols: u16,
     term_rows: u16,
     attached_id: Option<usize>,
+    needs_clear: bool,
+    needs_redraw: bool,
 }
 
 impl App {
@@ -89,9 +93,13 @@ impl App {
             rename_input: String::new(),
             worktree_mode: false,
             worktree_input: String::new(),
+            confirm_shutdown: false,
+            error_message: None,
             term_cols,
             term_rows,
             attached_id: None,
+            needs_clear: false,
+            needs_redraw: true, // First frame always draws
         }
     }
 
@@ -105,6 +113,7 @@ impl App {
         }
         self.selected = (self.selected + 1) % self.sessions.len();
         self.list_state.select(Some(self.selected));
+        self.needs_redraw = true;
     }
 
     fn prev(&mut self) {
@@ -117,6 +126,7 @@ impl App {
             self.selected - 1
         };
         self.list_state.select(Some(self.selected));
+        self.needs_redraw = true;
     }
 
     fn move_session_up(&mut self) -> Option<(usize, usize)> {
@@ -129,6 +139,7 @@ impl App {
         self.sessions.swap(self.selected, new_index);
         self.selected = new_index;
         self.list_state.select(Some(new_index));
+        self.needs_redraw = true;
         Some((id, new_index))
     }
 
@@ -142,6 +153,7 @@ impl App {
         self.sessions.swap(self.selected, new_index);
         self.selected = new_index;
         self.list_state.select(Some(new_index));
+        self.needs_redraw = true;
         Some((id, new_index))
     }
 }
@@ -151,14 +163,14 @@ impl App {
 fn pane_size(cols: u16, rows: u16) -> (u16, u16) {
     // Match the UI layout exactly:
     // - Vertical: 1 (top bar) + content + 1 (bottom bar)
-    // - Horizontal: 22 (sidebar) + terminal
+    // - Horizontal: 30 (sidebar) + terminal
     // - Terminal has borders: -2 for left/right, -2 for top/bottom
     let content_rows = rows.saturating_sub(1 + 1); // top + bottom bars
     let term_rows = content_rows.saturating_sub(2).max(1); // border overhead
-    
-    let content_cols = cols.saturating_sub(22); // sidebar width
+
+    let content_cols = cols.saturating_sub(30); // sidebar width
     let term_cols = content_cols.saturating_sub(2).max(1); // border overhead
-    
+
     (term_cols, term_rows)
 }
 
@@ -202,9 +214,9 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
         let sw = Arc::clone(&stream_write);
         thread::spawn(move || {
             loop {
-                // Use a short timeout so we don't block forever and starve the render loop
+                // Use longer timeout to reduce spinning when idle
                 read_stream
-                    .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+                    .set_read_timeout(Some(std::time::Duration::from_millis(200)))
                     .ok();
                 match recv_msg::<_, DaemonMsg>(&mut read_stream) {
                     Ok(msg) => {
@@ -213,7 +225,8 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                         match msg {
                             DaemonMsg::PtyOutput { id, data } => {
                                 let parser = {
-                                    let app = app.lock().unwrap();
+                                    let mut app = app.lock().unwrap();
+                                    app.needs_redraw = true; // New terminal content
                                     app.sessions
                                         .iter()
                                         .find(|s| s.id == id)
@@ -226,6 +239,7 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                             DaemonMsg::SessionCreated { id, name } => {
                                 let (tc, tr) = {
                                     let mut app = app.lock().unwrap();
+                                    app.needs_redraw = true; // Session list changed
                                     let (tc, tr) = (app.term_cols, app.term_rows);
                                     app.sessions.push(ClientSession {
                                         id,
@@ -245,11 +259,16 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                 // auto-attach to the new session (lock released above)
                                 let _ = send_msg(
                                     &mut *sw.lock().unwrap(),
-                                    &ClientMsg::Attach { id, cols: tc, rows: tr },
+                                    &ClientMsg::Attach {
+                                        id,
+                                        cols: tc,
+                                        rows: tr,
+                                    },
                                 );
                             }
                             DaemonMsg::SessionDeleted { id } => {
                                 let mut app = app.lock().unwrap();
+                                app.needs_redraw = true; // Session list changed
                                 app.sessions.retain(|s| s.id != id);
                                 if app.sessions.is_empty() {
                                     app.selected = 0;
@@ -264,13 +283,17 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                             }
                             DaemonMsg::SessionRenamed { id, name } => {
                                 let mut app = app.lock().unwrap();
+                                app.needs_redraw = true; // Session name changed
                                 if let Some(s) = app.sessions.iter_mut().find(|s| s.id == id) {
                                     s.name = name;
                                 }
                             }
                             DaemonMsg::SessionReordered { id, new_index } => {
                                 let mut app = app.lock().unwrap();
-                                if let Some(old_index) = app.sessions.iter().position(|s| s.id == id) {
+                                app.needs_redraw = true; // Session order changed
+                                if let Some(old_index) =
+                                    app.sessions.iter().position(|s| s.id == id)
+                                {
                                     if new_index < app.sessions.len() {
                                         let session = app.sessions.remove(old_index);
                                         app.sessions.insert(new_index, session);
@@ -280,9 +303,13 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                             app.list_state.select(Some(new_index));
                                         } else {
                                             // Adjust selection index if another session was moved around it
-                                            let selected = if old_index < app.selected && new_index >= app.selected {
+                                            let selected = if old_index < app.selected
+                                                && new_index >= app.selected
+                                            {
                                                 app.selected - 1
-                                            } else if old_index > app.selected && new_index <= app.selected {
+                                            } else if old_index > app.selected
+                                                && new_index <= app.selected
+                                            {
                                                 app.selected + 1
                                             } else {
                                                 app.selected
@@ -295,6 +322,7 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                             }
                             DaemonMsg::CwdUpdate { id, cwd } => {
                                 let mut app = app.lock().unwrap();
+                                app.needs_redraw = true; // CWD changed
                                 if let Some(s) = app.sessions.iter_mut().find(|s| s.id == id) {
                                     s.cwd = Some(cwd);
                                 }
@@ -302,15 +330,22 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                             DaemonMsg::Attached { id, cleared: _ } => {
                                 let mut app = app.lock().unwrap();
                                 app.attached_id = Some(id);
+                                app.needs_clear = true;
+                                app.needs_redraw = true; // Session switch
                                 // Parser was already reset when Attach was sent (before server
                                 // replayed buffered output), so no action needed here.
                             }
                             DaemonMsg::Detached => {
-                                app.lock().unwrap().attached_id = None;
+                                let mut app = app.lock().unwrap();
+                                app.attached_id = None;
+                                app.needs_redraw = true; // Detach state changed
                             }
-                            DaemonMsg::Error { .. }
-                            | DaemonMsg::SessionList { .. }
-                            | DaemonMsg::Ok => {}
+                            DaemonMsg::Error { msg } => {
+                                let mut app = app.lock().unwrap();
+                                app.error_message = Some(msg);
+                                app.needs_redraw = true; // Error displayed
+                            }
+                            DaemonMsg::SessionList { .. } | DaemonMsg::Ok => {}
                         }
                     }
                     Err(e)
@@ -342,7 +377,11 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
             }
             send_msg(
                 &mut *stream_write.lock().unwrap(),
-                &ClientMsg::Attach { id, cols: tc, rows: tr },
+                &ClientMsg::Attach {
+                    id,
+                    cols: tc,
+                    rows: tr,
+                },
             )?;
         }
     }
@@ -351,18 +390,45 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
     let mut detach = false;
     let mut prefix_mode = PrefixMode::Normal;
 
+    // Paste batching: accumulate rapid keystrokes, flush as one chunk.
+    let mut paste_buf: Vec<u8> = Vec::new();
+    let mut paste_deadline: Option<std::time::Instant> = None;
+
     // Actions that require work outside the app lock (sending messages after lock release)
     enum Action {
         None,
         Detach,
         Shutdown,
         SendMsg(crate::protocol::ClientMsg),
+        /// Accumulate bytes into paste buffer; if flush_immediately, send right away.
+        AccumulateInput { data: Vec<u8>, flush_immediately: bool },
     }
 
     loop {
+        // Flush paste buffer if deadline has passed
+        if let Some(deadline) = paste_deadline {
+            if std::time::Instant::now() >= deadline && !paste_buf.is_empty() {
+                let data = std::mem::take(&mut paste_buf);
+                paste_deadline = None;
+                let _ = send_msg(
+                    &mut *stream_write.lock().unwrap(),
+                    &ClientMsg::Input { data },
+                );
+            }
+        }
+
         {
             let mut app = app.lock().unwrap();
-            terminal.draw(|f| ui(f, &mut app, prefix_mode == PrefixMode::Pending))?;
+            if app.needs_clear {
+                terminal.clear()?;
+                app.needs_clear = false;
+                app.needs_redraw = true; // Always redraw after clear
+            }
+            // Only draw if something changed
+            if app.needs_redraw {
+                terminal.draw(|f| ui(f, &mut app, prefix_mode == PrefixMode::Pending))?;
+                app.needs_redraw = false;
+            }
         }
 
         if event::poll(std::time::Duration::from_millis(16))? {
@@ -371,13 +437,18 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                     // All app mutation happens in this block; lock is released at end of block
                     let action = {
                         let mut app = app.lock().unwrap();
+                        app.needs_redraw = true; // Any keypress triggers redraw
 
                         // --- Prefix pending: next key is a mbulet command ---
                         if prefix_mode == PrefixMode::Pending {
                             prefix_mode = PrefixMode::Normal;
                             match (key.code, key.modifiers) {
                                 (KeyCode::Char('d'), KeyModifiers::NONE) => Action::Detach,
-                                (KeyCode::Char('q'), KeyModifiers::NONE) => Action::Shutdown,
+                                (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                                    // Show confirmation popup instead of immediate shutdown
+                                    app.confirm_shutdown = true;
+                                    Action::None
+                                }
                                 (KeyCode::Tab, _) => {
                                     app.focus = Focus::Sidebar;
                                     Action::None
@@ -386,6 +457,7 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                     if app.focus == Focus::Sidebar {
                                         app.worktree_mode = true;
                                         app.worktree_input.clear();
+                                        app.error_message = None; // Clear any previous error
                                     }
                                     Action::None
                                 }
@@ -393,7 +465,10 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                     if app.focus == Focus::Sidebar {
                                         // Sidebar focus: move selected session up
                                         if let Some((id, new_index)) = app.move_session_up() {
-                                            Action::SendMsg(ClientMsg::ReorderSession { id, new_index })
+                                            Action::SendMsg(ClientMsg::ReorderSession {
+                                                id,
+                                                new_index,
+                                            })
                                         } else {
                                             Action::None
                                         }
@@ -403,7 +478,11 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                             app.prev();
                                             if let Some(id) = app.current_id() {
                                                 let (tc, tr) = (app.term_cols, app.term_rows);
-                                                Action::SendMsg(ClientMsg::Attach { id, cols: tc, rows: tr })
+                                                Action::SendMsg(ClientMsg::Attach {
+                                                    id,
+                                                    cols: tc,
+                                                    rows: tr,
+                                                })
                                             } else {
                                                 Action::None
                                             }
@@ -416,7 +495,10 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                     if app.focus == Focus::Sidebar {
                                         // Sidebar focus: move selected session down
                                         if let Some((id, new_index)) = app.move_session_down() {
-                                            Action::SendMsg(ClientMsg::ReorderSession { id, new_index })
+                                            Action::SendMsg(ClientMsg::ReorderSession {
+                                                id,
+                                                new_index,
+                                            })
                                         } else {
                                             Action::None
                                         }
@@ -426,7 +508,11 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                             app.next();
                                             if let Some(id) = app.current_id() {
                                                 let (tc, tr) = (app.term_cols, app.term_rows);
-                                                Action::SendMsg(ClientMsg::Attach { id, cols: tc, rows: tr })
+                                                Action::SendMsg(ClientMsg::Attach {
+                                                    id,
+                                                    cols: tc,
+                                                    rows: tr,
+                                                })
                                             } else {
                                                 Action::None
                                             }
@@ -436,14 +522,21 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                     }
                                 }
                                 // Prefix + Prefix → send literal prefix to terminal
-                                (KeyCode::Char(c), m) if c == PREFIX_KEY && m == PREFIX_MODIFIERS => {
+                                (KeyCode::Char(c), m)
+                                    if c == PREFIX_KEY && m == PREFIX_MODIFIERS =>
+                                {
                                     if app.focus == Focus::Terminal {
                                         // Ctrl+B = 0x02
-                                        let byte = if PREFIX_KEY == 'b' && PREFIX_MODIFIERS == KeyModifiers::CONTROL {
+                                        let byte = if PREFIX_KEY == 'b'
+                                            && PREFIX_MODIFIERS == KeyModifiers::CONTROL
+                                        {
                                             0x02
                                         } else {
                                             // For other prefix keys, compute the control char
-                                            (PREFIX_KEY as u8).to_ascii_lowercase().saturating_sub(b'a').saturating_add(1)
+                                            (PREFIX_KEY as u8)
+                                                .to_ascii_lowercase()
+                                                .saturating_sub(b'a')
+                                                .saturating_add(1)
                                         };
                                         Action::SendMsg(ClientMsg::Input { data: vec![byte] })
                                     } else {
@@ -454,10 +547,27 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                             }
 
                         // --- Prefix key in any focus → enter pending mode ---
-                        } else if key.code == KeyCode::Char(PREFIX_KEY) && key.modifiers == PREFIX_MODIFIERS {
+                        } else if key.code == KeyCode::Char(PREFIX_KEY)
+                            && key.modifiers == PREFIX_MODIFIERS
+                        {
                             prefix_mode = PrefixMode::Pending;
                             Action::None
-
+                        } else if app.confirm_shutdown {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    app.confirm_shutdown = false;
+                                    Action::Shutdown
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    app.confirm_shutdown = false;
+                                    Action::None
+                                }
+                                _ => Action::None,
+                            }
+                        } else if app.error_message.is_some() {
+                            // Error message is showing - any key dismisses it
+                            app.error_message = None;
+                            Action::None
                         } else if app.worktree_mode {
                             match key.code {
                                 KeyCode::Enter => {
@@ -465,8 +575,13 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                     app.worktree_mode = false;
                                     app.worktree_input.clear();
                                     if !branch.is_empty() {
+                                        // Sanitize branch name for session name (replace / with -)
+                                        // while preserving actual git branch name
+                                        let session_name = branch.replace('/', "-");
                                         let (tc, tr) = (app.term_cols, app.term_rows);
-                                        let cwd = app.sessions.get(app.selected)
+                                        let cwd = app
+                                            .sessions
+                                            .get(app.selected)
                                             .and_then(|s| s.cwd.clone());
                                         let cmd = if let Some(cwd) = cwd {
                                             format!(
@@ -480,7 +595,7 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                             )
                                         };
                                         Action::SendMsg(ClientMsg::NewSession {
-                                            name: branch,
+                                            name: session_name,
                                             cols: tc,
                                             rows: tr,
                                             startup_cmds: vec![cmd],
@@ -492,13 +607,19 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                 KeyCode::Esc => {
                                     app.worktree_mode = false;
                                     app.worktree_input.clear();
+                                    app.error_message = None; // Clear error on cancel
                                     Action::None
                                 }
-                                KeyCode::Backspace => { app.worktree_input.pop(); Action::None }
-                                KeyCode::Char(c) => { app.worktree_input.push(c); Action::None }
+                                KeyCode::Backspace => {
+                                    app.worktree_input.pop();
+                                    Action::None
+                                }
+                                KeyCode::Char(c) => {
+                                    app.worktree_input.push(c);
+                                    Action::None
+                                }
                                 _ => Action::None,
                             }
-
                         } else if app.rename_mode {
                             match key.code {
                                 KeyCode::Enter => {
@@ -523,13 +644,19 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                 KeyCode::Esc => {
                                     app.rename_mode = false;
                                     app.rename_input.clear();
+                                    app.error_message = None; // Clear error on cancel
                                     Action::None
                                 }
-                                KeyCode::Backspace => { app.rename_input.pop(); Action::None }
-                                KeyCode::Char(c) => { app.rename_input.push(c); Action::None }
+                                KeyCode::Backspace => {
+                                    app.rename_input.pop();
+                                    Action::None
+                                }
+                                KeyCode::Char(c) => {
+                                    app.rename_input.push(c);
+                                    Action::None
+                                }
                                 _ => Action::None,
                             }
-
                         } else {
                             match app.focus {
                                 Focus::Sidebar => match (key.code, key.modifiers) {
@@ -537,32 +664,55 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                         app.next();
                                         if let Some(id) = app.current_id() {
                                             let (tc, tr) = (app.term_cols, app.term_rows);
-                                            Action::SendMsg(ClientMsg::Attach { id, cols: tc, rows: tr })
-                                        } else { Action::None }
+                                            Action::SendMsg(ClientMsg::Attach {
+                                                id,
+                                                cols: tc,
+                                                rows: tr,
+                                            })
+                                        } else {
+                                            Action::None
+                                        }
                                     }
                                     (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
                                         app.prev();
                                         if let Some(id) = app.current_id() {
                                             let (tc, tr) = (app.term_cols, app.term_rows);
-                                            Action::SendMsg(ClientMsg::Attach { id, cols: tc, rows: tr })
-                                        } else { Action::None }
+                                            Action::SendMsg(ClientMsg::Attach {
+                                                id,
+                                                cols: tc,
+                                                rows: tr,
+                                            })
+                                        } else {
+                                            Action::None
+                                        }
                                     }
                                     (KeyCode::Char('n'), _) => {
                                         let count = app.sessions.len() + 1;
                                         let name = format!("session-{}", count);
                                         let (tc, tr) = (app.term_cols, app.term_rows);
-                                        Action::SendMsg(ClientMsg::NewSession { name, cols: tc, rows: tr, startup_cmds: vec![] })
+                                        Action::SendMsg(ClientMsg::NewSession {
+                                            name,
+                                            cols: tc,
+                                            rows: tr,
+                                            startup_cmds: vec![],
+                                        })
                                     }
                                     (KeyCode::Char('r'), _) => {
-                                        app.rename_input = app.sessions.get(app.selected)
-                                            .map(|s| s.name.clone()).unwrap_or_default();
+                                        app.rename_input = app
+                                            .sessions
+                                            .get(app.selected)
+                                            .map(|s| s.name.clone())
+                                            .unwrap_or_default();
                                         app.rename_mode = true;
+                                        app.error_message = None; // Clear any previous error
                                         Action::None
                                     }
                                     (KeyCode::Char('d'), _) => {
                                         if let Some(id) = app.current_id() {
                                             Action::SendMsg(ClientMsg::DeleteSession { id })
-                                        } else { Action::None }
+                                        } else {
+                                            Action::None
+                                        }
                                     }
                                     (KeyCode::Enter, _) | (KeyCode::Tab, _) => {
                                         app.focus = Focus::Terminal;
@@ -572,7 +722,16 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                                 },
                                 Focus::Terminal => {
                                     if let Some(bytes) = key_to_bytes(key) {
-                                        Action::SendMsg(ClientMsg::Input { data: bytes })
+                                        // Flush immediately for control keys that should
+                                        // not be delayed: Enter, Ctrl+C, Esc, Backspace.
+                                        let flush_immediately = matches!(
+                                            bytes.as_slice(),
+                                            [b'\r']        // Enter
+                                            | [0x03]       // Ctrl+C
+                                            | [0x1b]       // Esc (bare, not sequence)
+                                            | [0x7f]       // Backspace
+                                        );
+                                        Action::AccumulateInput { data: bytes, flush_immediately }
                                     } else {
                                         Action::None
                                     }
@@ -584,18 +743,45 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
 
                     // Act on the result outside the lock
                     match action {
-                        Action::Detach => { detach = true; break; }
-                        Action::Shutdown => { shutdown = true; break; }
+                        Action::Detach => {
+                            detach = true;
+                            break;
+                        }
+                        Action::Shutdown => {
+                            shutdown = true;
+                            break;
+                        }
                         Action::SendMsg(msg) => {
                             // Reset parser BEFORE sending Attach to ensure clean slate
                             // when server replays buffered output
                             if let ClientMsg::Attach { id, cols, rows } = &msg {
                                 let app = app.lock().unwrap();
                                 if let Some(s) = app.sessions.iter().find(|s| s.id == *id) {
-                                    *s.parser.lock().unwrap() = vt100::Parser::new(*rows.max(&1), *cols.max(&1), 0);
+                                    *s.parser.lock().unwrap() =
+                                        vt100::Parser::new(*rows.max(&1), *cols.max(&1), 0);
                                 }
                             }
                             let _ = send_msg(&mut *stream_write.lock().unwrap(), &msg);
+                        }
+                        Action::AccumulateInput { data, flush_immediately } => {
+                            paste_buf.extend_from_slice(&data);
+                            if flush_immediately {
+                                // Send immediately — don't wait for deadline
+                                let chunk = std::mem::take(&mut paste_buf);
+                                paste_deadline = None;
+                                let _ = send_msg(
+                                    &mut *stream_write.lock().unwrap(),
+                                    &ClientMsg::Input { data: chunk },
+                                );
+                            } else {
+                                // Start or extend the debounce deadline
+                                if paste_deadline.is_none() {
+                                    paste_deadline = Some(
+                                        std::time::Instant::now()
+                                            + std::time::Duration::from_millis(10),
+                                    );
+                                }
+                            }
                         }
                         Action::None => {}
                     }
@@ -607,6 +793,7 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
                         let mut app = app.lock().unwrap();
                         app.term_cols = tc;
                         app.term_rows = tr;
+                        app.needs_redraw = true; // Terminal resized
                         if app.attached_id.is_some() {
                             Some(ClientMsg::Resize { cols: tc, rows: tr })
                         } else {
@@ -644,7 +831,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App, ctrl_m_pending: bool) {
     let vchunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(5),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -654,26 +841,58 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App, ctrl_m_pending: bool) {
 
     let hchunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(22), Constraint::Min(0)])
+        .constraints([Constraint::Length(30), Constraint::Min(0)])
         .split(vchunks[1]);
 
     draw_sidebar(frame, app, hchunks[0]);
     draw_terminal(frame, app, hchunks[1]);
     draw_footer(frame, app, vchunks[2], ctrl_m_pending);
+
+    // Draw confirmation popup if active
+    if app.confirm_shutdown {
+        draw_confirmation_popup(frame, full);
+    }
 }
 
 fn draw_topbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let n = app.sessions.len();
     let right_text = format!("Sessions: {}  ", n);
-    let bar = Paragraph::new(Line::from(Span::styled(
-        "  mbulet",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-            .bg(BAR_BG),
-    )))
-    .style(Style::default().bg(BAR_BG))
-    .alignment(Alignment::Left);
+
+    let ascii_lines = vec![
+        Line::from(Span::styled(
+            r"           _           _      _  ",
+            Style::default().fg(Color::Cyan).bg(BAR_BG),
+        )),
+        Line::from(Span::styled(
+            r" _ __ ___ | |__  _   _| | ___| |_",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+                .bg(BAR_BG),
+        )),
+        Line::from(Span::styled(
+            r"| '_ ` _ \| '_ \| | | | |/ _ \ __|",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+                .bg(BAR_BG),
+        )),
+        Line::from(Span::styled(
+            r"| | | | | | |_) | |_| | |  __/ |_ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+                .bg(BAR_BG),
+        )),
+        Line::from(Span::styled(
+            r"|_| |_| |_|_.__/ \__,_|_|\___|\__|",
+            Style::default().fg(Color::Cyan).bg(BAR_BG),
+        )),
+    ];
+
+    let bar = Paragraph::new(ascii_lines)
+        .style(Style::default().bg(BAR_BG))
+        .alignment(Alignment::Left);
     frame.render_widget(bar, area);
 
     let right_width = right_text.len() as u16;
@@ -698,8 +917,30 @@ fn draw_topbar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect, ctrl_m_pending: bool) {
     // Helper closures for styled spans
     let key = |s: &str| Span::styled(s.to_string(), Style::default().fg(Color::Cyan).bg(BAR_BG));
-    let sep = |s: &str| Span::styled(s.to_string(), Style::default().fg(Color::DarkGray).bg(BAR_BG));
-    let warn = |s: &str| Span::styled(s.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(BAR_BG));
+    let sep = |s: &str| {
+        Span::styled(
+            s.to_string(),
+            Style::default().fg(Color::DarkGray).bg(BAR_BG),
+        )
+    };
+    let warn = |s: &str| {
+        Span::styled(
+            s.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+                .bg(BAR_BG),
+        )
+    };
+    let error = |s: &str| {
+        Span::styled(
+            s.to_string(),
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD)
+                .bg(BAR_BG),
+        )
+    };
 
     // Display prefix key dynamically
     let prefix_display = if PREFIX_MODIFIERS == KeyModifiers::CONTROL {
@@ -710,60 +951,109 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect, ctrl_m_pending
         PREFIX_KEY.to_string()
     };
 
-    // Prefix pending: show command mode indicator regardless of focus
-    let text = if ctrl_m_pending {
+    // Show error message if present
+    let text = if let Some(ref err_msg) = app.error_message {
+        Line::from(vec![
+            sep("  "),
+            error("✗ Error: "),
+            error(err_msg),
+            sep("  "),
+            key("Esc"),
+            sep(": dismiss  "),
+        ])
+    } else if app.confirm_shutdown {
+        Line::from(vec![
+            sep("  "),
+            warn("⚠ Confirm shutdown: "),
+            key("y"),
+            sep(": yes   "),
+            key("n"),
+            sep(" / "),
+            key("Esc"),
+            sep(": cancel  "),
+        ])
+    } else if ctrl_m_pending {
         Line::from(vec![
             warn(&format!("  ⌨  {} ", prefix_display)),
             sep("→ "),
-            key("d"), sep(": detach   "),
-            key("q"), sep(": shutdown   "),
-            key("Tab"), sep(": sidebar   "),
-            key(&prefix_display), sep(": send prefix   "),
-            key("w"), sep(": worktree   "),
-            key("↑/↓"), sep(": move session  "),
+            key("d"),
+            sep(": detach   "),
+            key("q"),
+            sep(": shutdown   "),
+            key("Tab"),
+            sep(": sidebar   "),
+            key(&prefix_display),
+            sep(": send prefix   "),
+            key("w"),
+            sep(": worktree   "),
+            key("↑/↓"),
+            sep(": move session  "),
         ])
     } else if app.worktree_mode {
         Line::from(vec![
             sep("  "),
             warn("worktree branch: "),
             sep("type branch name  "),
-            key("Enter"), sep(": create   "),
-            key("Esc"), sep(": cancel  "),
+            key("Enter"),
+            sep(": create   "),
+            key("Esc"),
+            sep(": cancel  "),
         ])
     } else if app.rename_mode {
         Line::from(vec![
             sep("  "),
-            key("Esc"), sep(": cancel   "),
-            key("Enter"), sep(": confirm  "),
+            key("Esc"),
+            sep(": cancel   "),
+            key("Enter"),
+            sep(": confirm  "),
         ])
     } else if app.focus == Focus::Sidebar {
         Line::from(vec![
             sep("  "),
-            key("j/k"), sep(": nav   "),
-            key("n"), sep(": new   "),
-            key("r"), sep(": rename   "),
-            key("d"), sep(": delete   "),
-            key("Enter"), sep(": open   "),
-            key(&format!("{} w", prefix_display)), sep(": worktree   "),
-            key(&format!("{} d", prefix_display)), sep(": detach   "),
-            key(&format!("{} q", prefix_display)), sep(": shutdown  "),
+            key("j/k"),
+            sep(": nav   "),
+            key("n"),
+            sep(": new   "),
+            key("r"),
+            sep(": rename   "),
+            key("d"),
+            sep(": delete   "),
+            key("Enter"),
+            sep(": open   "),
+            key(&format!("{} w", prefix_display)),
+            sep(": worktree   "),
+            key(&format!("{} d", prefix_display)),
+            sep(": detach   "),
+            key(&format!("{} q", prefix_display)),
+            sep(": shutdown  "),
         ])
     } else {
         // Terminal focus
         Line::from(vec![
             sep("  "),
-            key(&format!("{} ↑/↓", prefix_display)), sep(": switch session   "),
-            key(&format!("{} Tab", prefix_display)), sep(": sidebar   "),
-            key(&format!("{} d", prefix_display)), sep(": detach   "),
-            key(&format!("{} q", prefix_display)), sep(": shutdown   "),
-            key(&format!("{} {}", prefix_display, prefix_display)), sep(": send prefix  "),
+            key(&format!("{} ↑/↓", prefix_display)),
+            sep(": switch session   "),
+            key(&format!("{} Tab", prefix_display)),
+            sep(": sidebar   "),
+            key(&format!("{} d", prefix_display)),
+            sep(": detach   "),
+            key(&format!("{} q", prefix_display)),
+            sep(": shutdown   "),
+            key(&format!("{} {}", prefix_display, prefix_display)),
+            sep(": send prefix  "),
         ])
     };
-    frame.render_widget(Paragraph::new(text).style(Style::default().bg(BAR_BG)), area);
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().bg(BAR_BG)),
+        area,
+    );
 }
 
 fn draw_sidebar(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Sidebar && !app.rename_mode && !app.worktree_mode;
+    let focused = app.focus == Focus::Sidebar
+        && !app.rename_mode
+        && !app.worktree_mode
+        && !app.confirm_shutdown;
 
     let input_active = app.rename_mode || app.worktree_mode;
     let (list_area, input_area) = if input_active && area.height > 5 {
@@ -776,48 +1066,133 @@ fn draw_sidebar(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         (area, None)
     };
 
-    let items: Vec<ListItem> = app
+    // Draw outer container
+    let border_color = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let outer_block = Block::default()
+        .title(Span::styled(
+            " sessions ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+                .bg(SIDEBAR_BG),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(SIDEBAR_BG));
+
+    let inner_area = outer_block.inner(list_area);
+    frame.render_widget(outer_block, list_area);
+
+    // Calculate card heights and visible range
+    let card_heights: Vec<u16> = app
         .sessions
         .iter()
         .map(|s| {
-            ListItem::new(Line::from(vec![
-                Span::styled(" ● ", Style::default().fg(Color::Green).bg(SIDEBAR_BG)),
-                Span::styled(
-                    s.name.clone(),
-                    Style::default().fg(Color::White).bg(SIDEBAR_BG),
-                ),
-            ]))
+            let has_agent = detect_agent(s);
+            if has_agent.is_some() {
+                5
+            } else {
+                4
+            }
         })
         .collect();
 
-    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let total_cards = app.sessions.len();
+    if total_cards == 0 {
+        return;
+    }
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " sessions ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(SIDEBAR_BG),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color))
-                .style(Style::default().bg(SIDEBAR_BG)),
-        )
-        .style(Style::default().bg(SIDEBAR_BG))
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(40, 60, 120))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+    // Calculate scroll: show cards around selected index
+    let available_height = inner_area.height;
+    let selected = app.selected;
+    let mut visible_start;
+    let mut visible_end = selected;
 
-    frame.render_stateful_widget(list, list_area, &mut app.list_state);
+    // Try to center selected card, or show from selected downward if it fits
 
+    // First pass: can we fit selected + cards below?
+    let mut current_height = 0u16;
+    for i in selected..total_cards {
+        if current_height + card_heights[i] <= available_height {
+            current_height += card_heights[i];
+            visible_end = i + 1;
+        } else {
+            break;
+        }
+    }
+    visible_start = selected;
+
+    // If there's leftover space, add cards above
+    let mut remaining = available_height.saturating_sub(current_height);
+    if selected > 0 && remaining > 0 {
+        for i in (0..selected).rev() {
+            if remaining >= card_heights[i] {
+                remaining -= card_heights[i];
+                visible_start = i;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // If still not enough, extend downward again
+    if visible_end < total_cards && current_height < available_height {
+        let mut extra = available_height.saturating_sub(current_height);
+        for i in visible_end..total_cards {
+            if extra >= card_heights[i] {
+                extra -= card_heights[i];
+                visible_end = i + 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Ensure at least selected is visible
+    if visible_end <= visible_start {
+        visible_start = selected;
+        visible_end = (selected + 1).min(total_cards);
+    }
+
+    // Draw visible session cards
+    let mut y_offset = 0u16;
+    for (idx, session) in app.sessions.iter().enumerate() {
+        if idx < visible_start || idx >= visible_end {
+            continue;
+        }
+
+        let is_selected = idx == app.selected;
+        let card_height = card_heights[idx];
+
+        if y_offset + card_height > inner_area.height {
+            break; // No more space
+        }
+
+        let card_area = Rect {
+            x: inner_area.x,
+            y: inner_area.y + y_offset,
+            width: inner_area.width,
+            height: card_height,
+        };
+
+        draw_session_card(
+            frame,
+            session,
+            card_area,
+            is_selected,
+            focused,
+            app.attached_id,
+        );
+
+        y_offset += card_height;
+    }
+
+    // Draw input box if active
     if let Some(ia) = input_area {
         if app.rename_mode {
             let widget = Paragraph::new(Line::from(vec![
@@ -838,7 +1213,10 @@ fn draw_sidebar(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             frame.render_widget(widget, ia);
         } else if app.worktree_mode {
             let widget = Paragraph::new(Line::from(vec![
-                Span::styled("Branch: ", Style::default().fg(Color::Yellow).bg(SIDEBAR_BG)),
+                Span::styled(
+                    "Branch: ",
+                    Style::default().fg(Color::Yellow).bg(SIDEBAR_BG),
+                ),
                 Span::styled(
                     format!("{}_", app.worktree_input),
                     Style::default().fg(Color::White).bg(SIDEBAR_BG),
@@ -861,33 +1239,287 @@ fn draw_sidebar(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Draw a single session card
+fn draw_session_card(
+    frame: &mut ratatui::Frame,
+    session: &ClientSession,
+    area: Rect,
+    is_selected: bool,
+    sidebar_focused: bool,
+    attached_id: Option<usize>,
+) {
+    let is_attached = attached_id == Some(session.id);
+
+    // Border color: cyan if selected and focused, lighter gray if selected but not focused, dark gray otherwise
+    let border_color = if is_selected && sidebar_focused {
+        Color::Cyan
+    } else if is_selected {
+        Color::Gray
+    } else {
+        Color::DarkGray
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(SIDEBAR_BG));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Line 1: indicator + session name
+    let indicator = if is_selected { "▶ " } else { "  " };
+    let status_symbol = if is_attached { "●" } else { "○" };
+    let status_color = if is_attached {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+
+    let name_style = if is_selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+            .bg(SIDEBAR_BG)
+    } else {
+        Style::default().fg(Color::White).bg(SIDEBAR_BG)
+    };
+
+    let line1 = Line::from(vec![
+        Span::styled(indicator, Style::default().fg(Color::Cyan).bg(SIDEBAR_BG)),
+        Span::styled(
+            status_symbol,
+            Style::default().fg(status_color).bg(SIDEBAR_BG),
+        ),
+        Span::raw(" "),
+        Span::styled(&session.name, name_style),
+    ]);
+
+    // Line 2: cwd (truncated)
+    let cwd_display = session
+        .cwd
+        .as_ref()
+        .map(|p| {
+            // Replace home dir with ~
+            let home = std::env::var("HOME").unwrap_or_default();
+            let path = if !home.is_empty() && p.starts_with(&home) {
+                p.replacen(&home, "~", 1)
+            } else {
+                p.clone()
+            };
+
+            // Truncate to fit: area.width - 4 chars for "  " prefix and border
+            let max_len = (area.width.saturating_sub(4)) as usize;
+            if path.len() > max_len {
+                format!("...{}", &path[path.len() - (max_len - 3)..])
+            } else {
+                path
+            }
+        })
+        .unwrap_or_else(|| "~".to_string());
+
+    let line2 = Line::from(vec![
+        Span::styled("  ", Style::default().bg(SIDEBAR_BG)),
+        Span::styled(
+            cwd_display,
+            Style::default().fg(Color::DarkGray).bg(SIDEBAR_BG),
+        ),
+    ]);
+
+    // Line 3 (optional): detected agent
+    let agent_line = detect_agent(session).map(|agent_name| {
+        Line::from(vec![
+            Span::styled("  ◆ ", Style::default().fg(Color::DarkGray).bg(SIDEBAR_BG)),
+            Span::styled(
+                agent_name,
+                Style::default().fg(Color::Magenta).bg(SIDEBAR_BG),
+            ),
+        ])
+    });
+
+    // Render lines
+    let mut y = inner.y;
+    if y < inner.y + inner.height {
+        frame.render_widget(
+            Paragraph::new(line1).style(Style::default().bg(SIDEBAR_BG)),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        y += 1;
+    }
+
+    if y < inner.y + inner.height {
+        frame.render_widget(
+            Paragraph::new(line2).style(Style::default().bg(SIDEBAR_BG)),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        y += 1;
+    }
+
+    if let Some(agent_line) = agent_line {
+        if y < inner.y + inner.height {
+            frame.render_widget(
+                Paragraph::new(agent_line).style(Style::default().bg(SIDEBAR_BG)),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+/// Detect known agent/TUI from recent screen content
+fn detect_agent(session: &ClientSession) -> Option<String> {
+    let parser = session.parser.lock().unwrap();
+    let screen = parser.screen();
+    let rows = screen.size().0;
+
+    // Scan last 10 rows (or all if fewer)
+    let start_row = rows.saturating_sub(10).min(rows);
+    for row in start_row..rows {
+        let mut line_text = String::new();
+        for col in 0..screen.size().1 {
+            if let Some(cell) = screen.cell(row, col) {
+                line_text.push_str(&cell.contents());
+            }
+        }
+
+        let line_lower = line_text.to_lowercase();
+
+        // Check for known patterns (case-insensitive)
+        if line_lower.contains("claude") {
+            return Some("claude".to_string());
+        }
+        if line_lower.contains("opencode") {
+            return Some("opencode".to_string());
+        }
+        if line_lower.contains("gemini") {
+            return Some("gemini".to_string());
+        }
+        if line_lower.contains("codex") {
+            return Some("codex".to_string());
+        }
+        if line_lower.contains("aider") {
+            return Some("aider".to_string());
+        }
+        if line_lower.contains("cursor") {
+            return Some("cursor".to_string());
+        }
+    }
+
+    None
+}
+
 fn draw_terminal(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Terminal;
-    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
 
     let session = match app.sessions.get(app.selected) {
         Some(s) => s,
         None => return,
     };
 
+    // Split area: info box (3 lines) + terminal content
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Info box height
+            Constraint::Min(0),    // Terminal content
+        ])
+        .split(area);
+
+    // Draw info box
+    let status = if app.attached_id == Some(session.id) {
+        "attached"
+    } else {
+        "detached"
+    };
+    let status_color = if app.attached_id == Some(session.id) {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+
+    let cwd_display = session
+        .cwd
+        .as_ref()
+        .map(|p| {
+            // Truncate long paths nicely
+            if p.len() > 50 {
+                format!("...{}", &p[p.len() - 47..])
+            } else {
+                p.clone()
+            }
+        })
+        .unwrap_or_else(|| "~".to_string());
+
+    let info_lines = vec![
+        Line::from(vec![
+            Span::styled("  Session: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                &session.name,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(status, Style::default().fg(status_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Directory: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cwd_display, Style::default().fg(Color::Cyan)),
+        ]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(info_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        chunks[0],
+    );
+
+    // Draw terminal in remaining area
     let title = format!(" {} ", session.name);
     let inner = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+        x: chunks[1].x + 1,
+        y: chunks[1].y + 1,
+        width: chunks[1].width.saturating_sub(2),
+        height: chunks[1].height.saturating_sub(2),
     };
 
     frame.render_widget(
         Block::default()
             .title(Span::styled(
                 title,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color)),
-        area,
+        chunks[1],
     );
 
     // Ensure parser dimensions match the actual render area before drawing.
@@ -993,6 +1625,75 @@ fn vt100_color(color: vt100::Color) -> Color {
     }
 }
 
+fn draw_confirmation_popup(frame: &mut ratatui::Frame, area: Rect) {
+    // Calculate centered popup position
+    let popup_width = 50;
+    let popup_height = 7;
+    let popup_x = area.width.saturating_sub(popup_width) / 2;
+    let popup_y = area.height.saturating_sub(popup_height) / 2;
+
+    let popup_area = Rect {
+        x: area.x + popup_x,
+        y: area.y + popup_y,
+        width: popup_width.min(area.width),
+        height: popup_height.min(area.height),
+    };
+
+    // Semi-transparent background overlay (simulate with dark background)
+    let bg_block = Block::default().style(Style::default().bg(Color::Black));
+    frame.render_widget(bg_block, area);
+
+    // Confirmation dialog content
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Kill all sessions and shutdown daemon?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" - Yes, shutdown   ", Style::default().fg(Color::White)),
+            Span::styled(
+                "n",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" / ", Style::default().fg(Color::White)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" - Cancel", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let popup = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " ⚠ Confirm Shutdown ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .border_style(Style::default().fg(Color::Yellow))
+                .style(Style::default().bg(Color::Rgb(30, 30, 40))),
+        )
+        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+
+    frame.render_widget(popup, popup_area);
+}
+
 fn key_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
     use KeyCode::*;
     Some(match key.code {
@@ -1013,7 +1714,7 @@ fn key_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         Enter => vec![b'\r'],
         Backspace => vec![0x7f],
         Esc => vec![0x1b],
-        Tab => vec![b'\t'],  // pass through to shell (vim tab, autocomplete, etc.)
+        Tab => vec![b'\t'], // pass through to shell (vim tab, autocomplete, etc.)
         Up => b"\x1b[A".to_vec(),
         Down => b"\x1b[B".to_vec(),
         Right => b"\x1b[C".to_vec(),
