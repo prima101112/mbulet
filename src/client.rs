@@ -21,6 +21,12 @@ use std::{
 
 const SIDEBAR_BG: Color = Color::Rgb(18, 18, 28);
 const BAR_BG: Color = Color::Rgb(18, 18, 28);
+const TOP_BAR_HEIGHT: u16 = 5;
+const FOOTER_HEIGHT: u16 = 1;
+const SIDEBAR_WIDTH: u16 = 30;
+const INFO_BOX_HEIGHT: u16 = 3;
+const TERMINAL_VERTICAL_BORDERS: u16 = 2;
+const TERMINAL_HORIZONTAL_BORDERS: u16 = 2;
 
 /// Prefix key for mbulet commands (e.g., Ctrl+B). Change this single constant to use a different prefix.
 const PREFIX_KEY: char = 'b';
@@ -162,14 +168,20 @@ impl App {
 /// This must match the constraints in ui() to avoid parser/render desync.
 fn pane_size(cols: u16, rows: u16) -> (u16, u16) {
     // Match the UI layout exactly:
-    // - Vertical: 1 (top bar) + content + 1 (bottom bar)
-    // - Horizontal: 30 (sidebar) + terminal
-    // - Terminal has borders: -2 for left/right, -2 for top/bottom
-    let content_rows = rows.saturating_sub(1 + 1); // top + bottom bars
-    let term_rows = content_rows.saturating_sub(2).max(1); // border overhead
+    // - Vertical: TOP_BAR_HEIGHT + content + FOOTER_HEIGHT
+    // - content splits into INFO_BOX_HEIGHT + terminal
+    // - terminal has a surrounding border (top+bottom and left+right)
+    // - Horizontal: SIDEBAR_WIDTH + terminal
+    let content_rows = rows.saturating_sub(TOP_BAR_HEIGHT + FOOTER_HEIGHT);
+    let terminal_widget_rows = content_rows.saturating_sub(INFO_BOX_HEIGHT);
+    let term_rows = terminal_widget_rows
+        .saturating_sub(TERMINAL_VERTICAL_BORDERS)
+        .max(1);
 
-    let content_cols = cols.saturating_sub(30); // sidebar width
-    let term_cols = content_cols.saturating_sub(2).max(1); // border overhead
+    let content_cols = cols.saturating_sub(SIDEBAR_WIDTH);
+    let term_cols = content_cols
+        .saturating_sub(TERMINAL_HORIZONTAL_BORDERS)
+        .max(1);
 
     (term_cols, term_rows)
 }
@@ -214,9 +226,9 @@ pub fn run_client(socket_path: &str) -> io::Result<()> {
         let sw = Arc::clone(&stream_write);
         thread::spawn(move || {
             loop {
-                // Use longer timeout to reduce spinning when idle
+                // Reduced timeout for better responsiveness
                 read_stream
-                    .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                    .set_read_timeout(Some(std::time::Duration::from_millis(50)))
                     .ok();
                 match recv_msg::<_, DaemonMsg>(&mut read_stream) {
                     Ok(msg) => {
@@ -831,9 +843,9 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App, ctrl_m_pending: bool) {
     let vchunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(TOP_BAR_HEIGHT),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(FOOTER_HEIGHT),
         ])
         .split(full);
 
@@ -841,7 +853,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App, ctrl_m_pending: bool) {
 
     let hchunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(0)])
+        .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
         .split(vchunks[1]);
 
     draw_sidebar(frame, app, hchunks[0]);
@@ -1440,7 +1452,7 @@ fn draw_terminal(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Info box height
+            Constraint::Length(INFO_BOX_HEIGHT),
             Constraint::Min(0),    // Terminal content
         ])
         .split(area);

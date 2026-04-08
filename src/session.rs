@@ -13,7 +13,7 @@ pub struct Session {
     pub cwd: Arc<Mutex<Option<String>>>,
     child: Box<dyn portable_pty::Child + Send>,
     _slave: Box<dyn portable_pty::SlavePty + Send>,
-    master: Box<dyn MasterPty + Send>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     /// Temp ZDOTDIR dir to clean up on drop
     zdotdir: std::path::PathBuf,
     /// Raw PTY output buffer (ring buffer of last 65536 bytes)
@@ -188,7 +188,7 @@ PROMPT_SP=""
             cwd,
             child,
             _slave: pair.slave,
-            master: pair.master,
+            master: Arc::new(Mutex::new(pair.master)),
             zdotdir,
             output_buf,
             subscribers,
@@ -213,7 +213,7 @@ PROMPT_SP=""
             drop(parser);
             drop(ob);
             // SIGWINCH only on real size change — forces shell redraw at new size
-            let _ = self.master.resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
+            let _ = self.master.lock().unwrap().resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
         }
         // Same size: do nothing — buffered output already has correct screen state
         changed
@@ -222,7 +222,7 @@ PROMPT_SP=""
     pub fn resize(&self, cols: u16, rows: u16) {
         let (c, r) = (cols.max(1), rows.max(1));
         self.parser.lock().unwrap().set_size(r, c);
-        let _ = self.master.resize(PtySize {
+        let _ = self.master.lock().unwrap().resize(PtySize {
             rows: r, cols: c,
             pixel_width: 0, pixel_height: 0,
         });
@@ -240,12 +240,35 @@ PROMPT_SP=""
         rx
     }
 
-    pub fn buffered_output(&self) -> Vec<u8> {
-        self.output_buf.lock().unwrap().clone()
+    /// Returns a clean screen snapshot from vt100's contents_formatted().
+    /// This produces self-contained escape sequences that reconstruct the current
+    /// screen state from scratch, making no assumptions about the client's parser state.
+    /// Use this on same-size reattach instead of buffered_output() to fix theme corruption.
+    pub fn screen_snapshot(&self) -> Vec<u8> {
+        self.parser.lock().unwrap().screen().contents_formatted()
     }
 
     pub fn current_cwd(&self) -> Option<String> {
         self.cwd.lock().unwrap().clone()
+    }
+
+    /// Schedule a delayed screen redraw via SIGWINCH.
+    /// Spawns a detached thread that sleeps 150ms then sends ONE clean SIGWINCH
+    /// at the correct dimensions. This avoids back-to-back resize jitter.
+    /// Does NOT reset the vt100 parser or clear output buffer — server state stays intact.
+    pub fn schedule_redraw(&self, cols: u16, rows: u16) {
+        let (c, r) = (cols.max(1), rows.max(1));
+        let master = Arc::clone(&self.master);
+        
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(150));
+            let _ = master.lock().unwrap().resize(PtySize {
+                rows: r,
+                cols: c,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        });
     }
 }
 
